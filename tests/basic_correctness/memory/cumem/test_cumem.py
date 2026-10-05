@@ -478,3 +478,51 @@ def test_cudagraph_pool_sleep(level):
     weight.fill_(2.0)  # Level 2 discards weights; emulate the reload.
     held[0].replay()
     assert torch.equal(held[1], torch.full_like(x, 5.0))
+
+
+@pytest.mark.parametrize("level", [1, 2])
+@pytest.mark.parametrize("alias", [False, True])
+@create_new_process_for_each_test("spawn")
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="cuMem CUDA graph pool")
+def test_rejected_sleep_keeps_backend_running(level, alias):
+    """A pre-unmap rejection leaves existing mappings, graphs and state usable."""
+    from types import SimpleNamespace
+
+    from vllm.compilation.cudagraph_pool import capture_pool
+    from vllm.device_allocator import get_mem_allocator_instance
+    from vllm.device_allocator.sleep_mode_backend import CuMemBackend
+
+    allocator = get_mem_allocator_instance()
+    backend = CuMemBackend()
+    graph = torch.cuda.CUDAGraph()
+    x = torch.ones(1024, device="cuda")
+    out = torch.empty_like(x)
+    with (
+        capture_pool(
+            torch.cuda.graph_pool_handle(),
+            SimpleNamespace(use_cumem_cudagraph_pool=True),
+        ) as pool,
+        torch.cuda.graph(graph, pool=pool, stream=torch.cuda.Stream()),
+    ):
+        constant = torch.empty_like(x)
+        out.copy_(x + constant)
+    constant.fill_(3)
+    if alias:
+        owner = constant.view(-1)
+        del constant
+    else:
+        owner = constant
+    before = {p: (d.handle, d.is_asleep) for p, d in allocator.pointer_to_data.items()}
+    with pytest.raises(RuntimeError, match="tensors are live"):
+        backend.suspend(level=level)
+    assert before == {
+        p: (d.handle, d.is_asleep) for p, d in allocator.pointer_to_data.items()
+    }
+    assert all(d.cpu_backup_tensor is None for d in allocator.pointer_to_data.values())
+    graph.replay()
+    torch.accelerator.synchronize()
+    assert torch.equal(out, torch.full_like(out, 4))
+    assert owner.numel() == 1024
+    # An expected regression failure on the submitted candidate is evidence,
+    # not permission to change the state in this test.
+    assert backend.state() == "RUNNING"
